@@ -79,7 +79,15 @@ class GcsParquetExport(BackgroundJob):
         self.files_uploaded_last_cycle = 0
 
         self._busy = False
-        # run_immediately=True => one sync on startup, then every interval.
+        self.timer = None
+
+    def on_init_to_ready(self):
+        # Start the timer only once the job is READY. RepeatedTimer(run_immediately=True)
+        # fires in its own daemon thread, so starting it here (not in __init__) means the
+        # first sync sees state == READY (the _sync guard would otherwise skip it, and the
+        # next run wouldn't be for a full interval). The backfill runs in the timer thread,
+        # so this returns immediately and the job stays responsive.
+        super().on_init_to_ready()
         self.timer = RepeatedTimer(
             self.sync_interval_seconds, self._sync, job_name=self.job_name, run_immediately=True
         ).start()
@@ -128,18 +136,18 @@ class GcsParquetExport(BackgroundJob):
 
     def set_sync_interval_seconds(self, value) -> None:
         self.sync_interval_seconds = int(value)
-        if hasattr(self, "timer"):
+        if self.timer is not None:
             self.timer.cancel()
-        self.timer = RepeatedTimer(
-            self.sync_interval_seconds, self._sync, job_name=self.job_name, run_immediately=False
-        ).start()
+            self.timer = RepeatedTimer(
+                self.sync_interval_seconds, self._sync, job_name=self.job_name, run_immediately=False
+            ).start()
         self.logger.info(f"sync_interval_seconds set to {self.sync_interval_seconds}")
 
     # --------------------------------------------------------------------- lifecycle
 
     def on_disconnected(self):
         super().on_disconnected()
-        if hasattr(self, "timer"):
+        if self.timer is not None:
             self.timer.cancel()
 
 
