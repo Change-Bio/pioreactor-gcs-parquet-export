@@ -10,15 +10,19 @@ MQTT status fields around ``sync_once``.
 Data flow per cycle:
   SQLite (read-only, stdlib sqlite3)  ->  duckdb in-memory table  --COPY-->  local parquet  --uploader-->  GCS
 
-We read rows with stdlib sqlite3 and write parquet with duckdb's *bundled core*
-writer. We deliberately do NOT use duckdb's `sqlite_scanner` extension: on the
-Raspberry Pi leader (reported by duckdb as linux_i686) that extension isn't
-downloadable, but the core parquet writer needs no extension.
+Why this shape:
+- We read with stdlib sqlite3 and write parquet with duckdb's *bundled core* writer.
+  We do NOT use duckdb's `sqlite_scanner` extension: on the Pi leader (which duckdb
+  reports as linux_i686) that extension isn't downloadable, but core parquet needs none.
+- Incremental by a per-TABLE rowid watermark. Each cycle scans a table ONCE in rowid
+  order (`WHERE rowid > watermark`, which rides the integer-PK index) and partitions
+  the rows by experiment in Python. Filtering by `experiment` in SQL instead would do
+  a full table scan per experiment per batch (no index on `experiment`) — pathologically
+  slow on big tables. With this shape, an unchanged table costs a single O(1)
+  `MAX(rowid)` check, and new rows cost one sequential scan of just the tail.
 
-Incremental by rowid per (table, experiment): each cycle exports only rows with
-rowid in (saved_watermark, current_max] as immutable part files, sub-batched to
-bound memory. A self-heal guard re-backfills if the table appears to have
-shrunk/renumbered (e.g. VACUUM).
+A self-heal guard re-backfills a table if its max rowid went backwards (e.g. VACUUM
+renumbered rowids) — see "Known limitations" in the README.
 """
 from __future__ import annotations
 
@@ -52,6 +56,10 @@ def _ro_connect(db_path: str) -> sqlite3.Connection:
 
 def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def _quote_lit(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
 
 
 def gcs_join(*parts: str) -> str:
@@ -94,6 +102,12 @@ def table_has_rowid(conn: sqlite3.Connection, table: str) -> bool:
         return False
 
 
+def table_max_rowid(conn: sqlite3.Connection, table: str) -> int:
+    """MAX(rowid) — O(1) on a rowid table. 0 if empty."""
+    row = conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {_quote_ident(table)}").fetchone()
+    return int(row[0])
+
+
 def discover_experiment_tables(conn: sqlite3.Connection) -> list:
     names = [
         r[0]
@@ -112,33 +126,6 @@ def resolve_data_tables(conn: sqlite3.Connection, data_tables: str, exclude: Ite
     else:
         candidates = [t.strip() for t in data_tables.split(",") if t.strip()]
     return [t for t in candidates if t not in exclude and table_exists(conn, t)]
-
-
-def experiments_in_table(conn: sqlite3.Connection, table: str) -> list:
-    return [
-        r[0]
-        for r in conn.execute(
-            f"SELECT DISTINCT experiment FROM {_quote_ident(table)} "
-            "WHERE experiment IS NOT NULL ORDER BY experiment"
-        ).fetchall()
-    ]
-
-
-def partition_bounds(conn: sqlite3.Connection, table: str, experiment: str) -> tuple:
-    """(max_rowid, count) for one experiment partition. max_rowid is 0 if empty."""
-    row = conn.execute(
-        f"SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM {_quote_ident(table)} WHERE experiment = ?",
-        (experiment,),
-    ).fetchone()
-    return int(row[0]), int(row[1])
-
-
-def count_up_to(conn: sqlite3.Connection, table: str, experiment: str, rowid: int) -> int:
-    row = conn.execute(
-        f"SELECT COUNT(*) FROM {_quote_ident(table)} WHERE experiment = ? AND rowid <= ?",
-        (experiment, rowid),
-    ).fetchone()
-    return int(row[0])
 
 
 # ----------------------------------------------------------------------------- state (watermarks)
@@ -177,16 +164,45 @@ def _sqlite_decl_to_duckdb(decl: str) -> str:
     return "VARCHAR"  # NUMERIC/unknown -> safe default
 
 
+def _json_default(o):
+    # sqlite only ever hands us str/int/float/None/bytes; bytes (BLOB) aren't JSON-able.
+    if isinstance(o, (bytes, bytearray)):
+        return o.decode("utf-8", "replace")
+    return str(o)
+
+
 def _write_parquet(col_defs: list, rows: list, out_path: str) -> None:
-    """col_defs: [(name, duckdb_type)]. Writes rows to a parquet file via duckdb core."""
-    con = duckdb.connect()  # in-memory; no extensions needed for parquet COPY
+    """col_defs: [(name, duckdb_type)]. Writes rows to a parquet file via duckdb core.
+
+    We stage the rows as newline-delimited JSON and let duckdb's C++ reader load them,
+    rather than `executemany` (which is ~200x slower — row-by-row INSERT is a duckdb
+    anti-pattern). JSON (vs CSV) preserves NULL-vs-"" and escapes arbitrary text losslessly.
+    """
+    con = duckdb.connect()  # in-memory; parquet + json readers are bundled core
     try:
-        ddl = ", ".join(f"{_quote_ident(n)} {t}" for n, t in col_defs)
-        con.execute(f"CREATE TABLE s ({ddl})")
-        if rows:
-            placeholders = ", ".join(["?"] * len(col_defs))
-            con.executemany(f"INSERT INTO s VALUES ({placeholders})", rows)
-        con.execute(f"COPY s TO '{out_path}' (FORMAT PARQUET)")
+        if not rows:
+            ddl = ", ".join(f"{_quote_ident(n)} {t}" for n, t in col_defs)
+            con.execute(f"CREATE TABLE s ({ddl})")
+            con.execute(f"COPY s TO {_quote_lit(out_path)} (FORMAT PARQUET)")
+            return
+        names = [n for n, _ in col_defs]
+        jsonl = out_path + ".jsonl"
+        try:
+            with open(jsonl, "w") as f:
+                for r in rows:
+                    f.write(json.dumps(dict(zip(names, r)), default=_json_default))
+                    f.write("\n")
+            colspec = "{" + ", ".join(f"{_quote_lit(n)}: {_quote_lit(t)}" for n, t in col_defs) + "}"
+            con.execute(
+                f"COPY (SELECT * FROM read_json({_quote_lit(jsonl)}, "
+                f"format='newline_delimited', columns={colspec})) "
+                f"TO {_quote_lit(out_path)} (FORMAT PARQUET)"
+            )
+        finally:
+            try:
+                os.remove(jsonl)
+            except OSError:
+                pass
     finally:
         con.close()
 
@@ -199,23 +215,6 @@ def export_full_parquet(conn: sqlite3.Connection, table: str, out_path: str) -> 
     col_defs = [(n, _sqlite_decl_to_duckdb(t)) for n, t in cols]
     _write_parquet(col_defs, rows, out_path)
     return len(rows)
-
-
-def _fetch_window(conn: sqlite3.Connection, table: str, experiment: str, lo: int, hi: int, limit: int):
-    """Return (data_rows, batch_hi) for rowids in (lo, hi], up to `limit` rows, ordered.
-    data_rows excludes the leading rowid; batch_hi is the max rowid in the batch (or None)."""
-    cols = _columns(conn, table)
-    col_list = ", ".join(_quote_ident(n) for n, _ in cols)
-    raw = conn.execute(
-        f"SELECT rowid, {col_list} FROM {_quote_ident(table)} "
-        "WHERE experiment = ? AND rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?",
-        (experiment, lo, hi, limit),
-    ).fetchall()
-    if not raw:
-        return [], None, cols
-    data = [r[1:] for r in raw]
-    batch_hi = raw[-1][0]
-    return data, batch_hi, cols
 
 
 # ----------------------------------------------------------------------------- upload
@@ -246,6 +245,67 @@ def _noop_log(level: str, msg: str) -> None:
     pass
 
 
+def _export_table(conn, con_cfg, table, state, uploader, log, should_continue, stats) -> None:
+    """Incrementally export one data table: single rowid-ordered scan, partition by
+    experiment in Python, one part file per (experiment, batch)."""
+    bucket, prefix, staging_dir, state_path, batch_rows = con_cfg
+
+    cur_max = table_max_rowid(conn, table)
+    saved_rowid = int(state.get(table, {}).get("rowid", 0))
+    if cur_max < saved_rowid:
+        log("warning", f"{table}: max rowid went backwards ({cur_max} < {saved_rowid}) "
+                        "(shrink/VACUUM?) — re-backfilling")
+        saved_rowid = 0
+    if cur_max <= saved_rowid:
+        return  # nothing new — O(1) for unchanged tables
+
+    cols = _columns(conn, table)
+    col_defs = [(n, _sqlite_decl_to_duckdb(t)) for n, t in cols]
+    col_list = ", ".join(_quote_ident(n) for n, _ in cols)
+    names = [n for n, _ in cols]
+    exp_idx = names.index("experiment")
+
+    cursor = saved_rowid
+    while cursor < cur_max:
+        if not should_continue():
+            break
+        raw = conn.execute(
+            f"SELECT rowid, {col_list} FROM {_quote_ident(table)} "
+            "WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT ?",
+            (cursor, cur_max, batch_rows),
+        ).fetchall()
+        if not raw:
+            break
+        batch_lo, batch_hi = cursor, raw[-1][0]
+
+        # group this batch's rows by experiment (data columns = row[1:], minus the rowid)
+        groups: dict = {}
+        for r in raw:
+            exp = r[1 + exp_idx]
+            if exp is None:
+                continue
+            groups.setdefault(exp, []).append(r[1:])
+
+        for exp, rows in groups.items():
+            slug = slugify_experiment(exp)
+            # Partition key is `experiment_slug` (NOT `experiment`): a Hive partition key
+            # must not duplicate an in-data column, or polars shadows the real name and
+            # BigQuery rejects the table. The real name stays in the data (we SELECT *).
+            fname = f"part-{batch_lo + 1:012d}-{batch_hi:012d}.parquet"
+            local = os.path.join(staging_dir, f"{table}__{slug}__{fname}")
+            dest = gcs_join(bucket, prefix, table, f"experiment_slug={slug}", fname)
+            _write_parquet(col_defs, rows, local)
+            uploader(local, dest)
+            os.remove(local)
+            stats["rows_uploaded"] += len(rows)
+            stats["files_uploaded"] += 1
+            log("debug", f"uploaded {dest} ({len(rows)} rows)")
+
+        cursor = batch_hi
+        state[table] = {"rowid": cursor}
+        save_state(state_path, state)  # persist progress per batch
+
+
 def sync_once(
     cfg: dict,
     uploader: Optional[Callable[[str, str], None]] = None,
@@ -268,6 +328,7 @@ def sync_once(
     state_path = cfg["state_path"]
     db_path = cfg["db_path"]
     batch_rows = int(cfg.get("batch_rows") or DEFAULT_BATCH_ROWS)
+    con_cfg = (bucket, prefix, staging_dir, state_path, batch_rows)
 
     os.makedirs(staging_dir, exist_ok=True)
     stats = {"rows_uploaded": 0, "files_uploaded": 0, "errors": []}
@@ -285,55 +346,12 @@ def sync_once(
             if not table_has_rowid(conn, table):
                 log("warning", f"{table}: WITHOUT ROWID — skipping (incremental needs rowid)")
                 continue
-            tstate = state.setdefault(table, {})
-            for exp in experiments_in_table(conn, table):
-                if not should_continue():
-                    break
-                try:
-                    cur_max, cur_cnt = partition_bounds(conn, table, exp)
-                    saved = tstate.get(exp)
-                    lo = 0
-                    if saved:
-                        saved_rowid = int(saved.get("rowid", 0))
-                        saved_cnt = int(saved.get("count", 0))
-                        if cur_max < saved_rowid or count_up_to(conn, table, exp, saved_rowid) != saved_cnt:
-                            log("warning", f"{table}/{exp}: watermark mismatch (shrink/VACUUM?) — re-backfilling")
-                            lo = 0
-                        else:
-                            lo = saved_rowid
-                    if cur_max <= lo:
-                        continue  # nothing new
-
-                    slug = slugify_experiment(exp)
-                    running = count_up_to(conn, table, exp, lo)
-                    cursor = lo
-                    while cursor < cur_max:
-                        if not should_continue():
-                            break
-                        data, batch_hi, cols = _fetch_window(conn, table, exp, cursor, cur_max, batch_rows)
-                        if not data:
-                            break
-                        # Partition key is `experiment_slug` (NOT `experiment`): a Hive
-                        # partition key must not duplicate an in-data column name, or
-                        # polars shadows the real name and BigQuery rejects the table.
-                        fname = f"part-{cursor + 1:012d}-{batch_hi:012d}.parquet"
-                        local = os.path.join(staging_dir, f"{table}__{slug}__{fname}")
-                        dest = gcs_join(bucket, prefix, table, f"experiment_slug={slug}", fname)
-                        col_defs = [(n, _sqlite_decl_to_duckdb(t)) for n, t in cols]
-                        _write_parquet(col_defs, data, local)
-                        uploader(local, dest)
-                        os.remove(local)
-                        running += len(data)
-                        tstate[exp] = {"rowid": batch_hi, "count": running}
-                        save_state(state_path, state)  # persist progress per part
-                        stats["rows_uploaded"] += len(data)
-                        stats["files_uploaded"] += 1
-                        log("debug", f"uploaded {dest} ({len(data)} rows)")
-                        cursor = batch_hi
-                except Exception as e:  # noqa: BLE001 — one partition failing must not kill the cycle
-                    msg = f"{table}/{exp}: {e}"
-                    stats["errors"].append(msg)
-                    log("error", msg)
+            try:
+                _export_table(conn, con_cfg, table, state, uploader, log, should_continue, stats)
+            except Exception as e:  # noqa: BLE001 — one table failing must not kill the cycle
+                msg = f"{table}: {e}"
+                stats["errors"].append(msg)
+                log("error", msg)
 
         # whole metadata tables (full overwrite each cycle)
         for table in cfg.get("meta_tables", []):
