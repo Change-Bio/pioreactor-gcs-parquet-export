@@ -23,7 +23,11 @@ setup(
         ]
     },
     install_requires=[
-        "duckdb>=0.10",
+        # Pinned: 1.5.1 is the newest duckdb with a prebuilt aarch64 / cp313 wheel
+        # (Raspberry Pi leader). Newer versions only ship an sdist for this platform,
+        # which forces a multi-minute C++ build that fails on the Pi. Bump when a
+        # wheel for the target version exists for linux-aarch64 + the leader's python.
+        "duckdb==1.5.1",
     ],
     entry_points={
         "pioreactor.plugins": "pioreactor_gcs_parquet_export = pioreactor_gcs_parquet_export"
