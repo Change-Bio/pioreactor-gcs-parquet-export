@@ -15,7 +15,7 @@ import click
 from pioreactor.background_jobs.base import BackgroundJob
 from pioreactor.config import config
 from pioreactor.utils.timing import RepeatedTimer
-from pioreactor.whoami import get_unit_name, get_latest_experiment_name
+from pioreactor.whoami import get_unit_name, UNIVERSAL_EXPERIMENT
 
 from pioreactor_gcs_parquet_export import exporter
 
@@ -152,10 +152,12 @@ class GcsParquetExport(BackgroundJob):
 )
 def click_gcs_parquet_export(sync_interval_seconds):
     """Start the GCS Parquet export job (leader only)."""
+    # Leader-only infra job, not tied to a single experiment — use the universal
+    # sentinel (same as Monitor) so it runs without an experiment assignment.
     job = GcsParquetExport(
         sync_interval_seconds=sync_interval_seconds,
         unit=get_unit_name(),
-        experiment=get_latest_experiment_name(),
+        experiment=UNIVERSAL_EXPERIMENT,
     )
     job.block_until_disconnected()
 
