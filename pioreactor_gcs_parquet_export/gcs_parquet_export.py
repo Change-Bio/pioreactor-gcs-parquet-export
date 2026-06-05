@@ -97,8 +97,14 @@ class GcsParquetExport(BackgroundJob):
     def _log(self, level: str, msg: str) -> None:
         getattr(self.logger, level, self.logger.info)(msg)
 
+    # States in which a sync must not run. We intentionally allow INIT as well as
+    # READY: the first (run_immediately) tick can fire during the INIT->READY
+    # transition, before the framework flips state to READY, and we don't want to
+    # drop the startup sync. Only a paused/stopped job should skip.
+    _SKIP_STATES = ("sleeping", "disconnected", "lost")
+
     def _sync(self) -> None:
-        if self.state != self.READY or self._busy:
+        if self._busy or self.state in self._SKIP_STATES:
             return
         self._busy = True
         self.last_sync_started_at = _now_iso()
@@ -106,7 +112,7 @@ class GcsParquetExport(BackgroundJob):
             stats = exporter.sync_once(
                 self.cfg,
                 log=self._log,
-                should_continue=lambda: self.state == self.READY,
+                should_continue=lambda: self.state not in self._SKIP_STATES,
             )
             self.rows_uploaded_last_cycle = stats["rows_uploaded"]
             self.files_uploaded_last_cycle = stats["files_uploaded"]
