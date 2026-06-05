@@ -167,6 +167,20 @@ def test_self_heal_on_shrink(tmp_path):
     assert df.filter(pl.col("timestamp") == "reborn").height >= 1
 
 
+def test_sub_batching_produces_multiple_parts(tmp_path):
+    db = tmp_path / "t.sqlite"
+    make_db(str(db))
+    cfg, bucket = make_cfg(tmp_path, db)
+    cfg["batch_rows"] = 2  # force multiple parts for the 5-row experiment
+    stats = ex.sync_once(cfg, uploader=local_uploader)
+    assert stats["errors"] == []
+    parts = sorted(os.listdir(f"{bucket}/od_readings/experiment_slug=Run_A_Variant_5"))
+    assert len(parts) == 3  # 5 rows / batch 2 -> ceil = 3 parts
+    # no rows lost or duplicated across parts
+    df = pl.read_parquet(f"{bucket}/od_readings/experiment_slug=Run_A_Variant_5/*.parquet")
+    assert df.height == 5
+
+
 def test_without_rowid_table_skipped(tmp_path):
     db = tmp_path / "t.sqlite"
     make_db(str(db))

@@ -58,6 +58,7 @@ class GcsParquetExport(BackgroundJob):
             ),
             "gcp_project": config.get(section, "gcp_project", fallback=""),
             "staging_dir": config.get(section, "staging_dir", fallback="/tmp/pioreactor_gcs_export"),
+            "batch_rows": config.getint(section, "batch_rows", fallback=200000),
             "db_path": config.get(
                 section, "db_path", fallback="/home/pioreactor/.pioreactor/storage/pioreactor.sqlite"
             ),
