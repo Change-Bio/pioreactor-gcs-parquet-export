@@ -8,6 +8,3 @@ build/
 __pycache__/
 *.pyc
 .pytest_cache/
-
-# local one-time migration (contains internal infra names — do not publish)
-migrate_postgres_to_lake.py

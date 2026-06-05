@@ -55,6 +55,7 @@ def make_cfg(tmp_path, db):
         "staging_dir": str(tmp_path / "staging"),
         "db_path": str(db),
         "state_path": str(tmp_path / "state.json"),
+        "source_label": "testunit",
     }, str(bucket_dir)
 
 
@@ -108,9 +109,12 @@ def test_full_sync_and_hive_readback(tmp_path):
     assert set(df["experiment_slug"].unique().to_list()) == {"Run_A_Variant_5", "260526_V12"}
     # the in-data experiment column is authoritative (real name w/ spaces), not shadowed
     assert df.filter(pl.col("experiment") == "Run A Variant 5").height == 5
-    # meta present
-    assert pl.read_parquet(f"{bucket}/_meta/experiments.parquet").height == 2
-    assert pl.read_parquet(f"{bucket}/_meta/workers.parquet").height == 1
+    # meta present, partitioned by source
+    assert pl.read_parquet(f"{bucket}/_meta/experiments/source=testunit/experiments.parquet").height == 2
+    assert pl.read_parquet(f"{bucket}/_meta/workers/source=testunit/workers.parquet").height == 1
+    # reads back with a `source` partition column for multi-source union
+    me = pl.read_parquet(f"{bucket}/_meta/experiments/**/*.parquet", hive_partitioning=True)
+    assert "source" in me.columns and set(me["source"].unique().to_list()) == {"testunit"}
 
 
 def test_incremental_only_new_rows(tmp_path):

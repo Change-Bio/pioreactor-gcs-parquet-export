@@ -59,6 +59,8 @@ class GcsParquetExport(BackgroundJob):
             "gcp_project": config.get(section, "gcp_project", fallback=""),
             "staging_dir": config.get(section, "staging_dir", fallback="/tmp/pioreactor_gcs_export"),
             "batch_rows": config.getint(section, "batch_rows", fallback=200000),
+            # label for this source's _meta partitions; defaults to the leader's unit name
+            "source_label": config.get(section, "source_label", fallback="") or unit,
             "db_path": config.get(
                 section, "db_path", fallback="/home/pioreactor/.pioreactor/storage/pioreactor.sqlite"
             ),

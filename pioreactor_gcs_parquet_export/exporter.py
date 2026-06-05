@@ -315,7 +315,8 @@ def sync_once(
     """Run one full sync cycle. Returns {rows_uploaded, files_uploaded, errors}.
 
     cfg keys: bucket, prefix, data_tables, exclude(list), meta_tables(list),
-              gcloud_path, gcp_project, staging_dir, db_path, state_path, batch_rows(opt).
+              gcloud_path, gcp_project, staging_dir, db_path, state_path,
+              batch_rows(opt), source_label(opt — partitions _meta tables).
     """
     if uploader is None:
         uploader = make_gcloud_uploader(cfg["gcloud_path"], cfg.get("gcp_project", ""))
@@ -353,7 +354,12 @@ def sync_once(
                 stats["errors"].append(msg)
                 log("error", msg)
 
-        # whole metadata tables (full overwrite each cycle)
+        # Whole metadata tables (small reference tables: experiments, workers, …).
+        # These aren't experiment-scoped, so they're partitioned by `source` instead —
+        # each source overwrites only its own `_meta/<table>/source=<label>/` partition
+        # every cycle, and they union on read. This mirrors how data tables partition by
+        # experiment, and lets several clusters/archives share one lake without clobber.
+        src_slug = slugify_experiment(cfg.get("source_label") or "unknown")
         for table in cfg.get("meta_tables", []):
             if not should_continue():
                 break
@@ -361,7 +367,7 @@ def sync_once(
                 continue
             try:
                 local = os.path.join(staging_dir, f"_meta__{table}.parquet")
-                dest = gcs_join(bucket, prefix, "_meta", f"{table}.parquet")
+                dest = gcs_join(bucket, prefix, "_meta", table, f"source={src_slug}", f"{table}.parquet")
                 n = export_full_parquet(conn, table, local)
                 uploader(local, dest)
                 os.remove(local)
