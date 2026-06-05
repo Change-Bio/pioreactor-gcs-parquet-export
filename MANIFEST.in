@@ -1,0 +1,5 @@
+recursive-include pioreactor_gcs_parquet_export/ui *.yaml
+include pioreactor_gcs_parquet_export/additional_config.ini
+include pioreactor_gcs_parquet_export/post_install.sh
+include pioreactor_gcs_parquet_export/pre_uninstall.sh
+include pioreactor_gcs_parquet_export/LEADER_ONLY

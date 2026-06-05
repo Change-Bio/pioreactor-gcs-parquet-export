@@ -1,0 +1,67 @@
+---
+display_name: GCS Parquet Export
+job_name: gcs_parquet_export
+display: true
+source: pioreactor_gcs_parquet_export
+description: >
+  Leader-only. Incrementally exports the leader's SQLite tables to Parquet in a
+  GCS bucket, partitioned by experiment (Hive layout under experiment_slug=...),
+  on startup and then every sync_interval_seconds. Configure the bucket, interval
+  and table selection in [gcs_parquet_export.config] in config.ini.
+
+published_settings:
+  - key: sync_interval_seconds
+    unit: s
+    label: Sync interval
+    description: Seconds between syncs. First sync runs immediately on start.
+    type: numeric
+    default: "3600"
+    display: true
+
+  - key: last_sync_status
+    unit: null
+    label: Last status
+    description: Result of the most recent sync (ok / error / completed with errors).
+    type: string
+    default: "never"
+    display: true
+
+  - key: last_sync_finished_at
+    unit: null
+    label: Last finished
+    description: UTC timestamp the last sync finished.
+    type: string
+    default: ""
+    display: true
+
+  - key: rows_uploaded_last_cycle
+    unit: rows
+    label: Rows uploaded (last cycle)
+    description: Number of new data rows uploaded in the most recent sync.
+    type: numeric
+    default: "0"
+    display: true
+
+  - key: files_uploaded_last_cycle
+    unit: files
+    label: Files uploaded (last cycle)
+    description: Number of parquet objects written in the most recent sync.
+    type: numeric
+    default: "0"
+    display: false
+
+  - key: last_sync_started_at
+    unit: null
+    label: Last started
+    description: UTC timestamp the last sync started.
+    type: string
+    default: ""
+    display: false
+
+  - key: last_error
+    unit: null
+    label: Last error
+    description: Most recent error message, if any.
+    type: string
+    default: ""
+    display: false

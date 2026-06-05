@@ -1,0 +1,10 @@
+# dev venv used for off-reactor testing
+.venv-dev/
+# build artifacts
+dist/
+build/
+*.egg-info/
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
